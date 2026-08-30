@@ -9,10 +9,11 @@ class H2O:
         budget=128,
         window_size=8,
         record_kept_token_indices=False,
+        **kwargs,
     ):
         assert budget - window_size > 0, "budget must be greater than window_size"
         self.budget = budget
-        self.window_size = 1
+        self.window_size = window_size
 
         # for recording kept token indices
         self.record_kept_token_indices = record_kept_token_indices
@@ -32,6 +33,7 @@ class H2O:
         if kv_cache_len < self.budget:
             return key_states, value_states
         else:
+            # Use TOVA style criterion (only use current query to compute importance)
             query_states = query_states[:, :, -1:, :]
             attn_weights = compute_attention_scores(query_states, key_states).squeeze(2)
 
@@ -41,7 +43,6 @@ class H2O:
                     dim=-1,
                     dtype=torch.float32,
                 )
-                .mean(dim=-2)
                 .to(query_states.dtype)
             )
 
