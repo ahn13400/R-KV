@@ -177,8 +177,9 @@ def parse_arguments():
     parser.add_argument(
         "--divide_method",
         type=str,
-        default="step_length",
-        choices=["newline", "step_length"],
+        default="generated_length",
+        choices=["newline", "step_length", "generated_length"],
+        help="generated_length mod divide length is the compression clock. This is batch-agnostic"
     )
     parser.add_argument("--divide_length", type=int, default=128)
     parser.add_argument(

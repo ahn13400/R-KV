@@ -16,6 +16,11 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.modeling_outputs import CausalLMOutputWithPast, BaseModelOutputWithPast
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 
+from .batching import (
+    build_additive_attention_mask,
+    compress_by_length_group,
+    padding_present,
+)
 from .compression import (
     R1KV,
     SnapKV,
@@ -33,6 +38,97 @@ KV_COMPRESSION_MAP = {
 }
 
 logger = logging.get_logger(__name__)
+
+
+def _valid_or_full(valid_lengths, tensor):
+    """Fall back to 'every row entirely real' when no validity bookkeeping exists."""
+    if valid_lengths is not None:
+        return valid_lengths
+    return torch.full(
+        (tensor.shape[0],), tensor.shape[2], dtype=torch.long, device=tensor.device
+    )
+
+
+def _compression_step(self, past_key_value, key_states, value_states, cached_queries, cache_kwargs, attention_mask, q_len):
+    """
+    Unified compression step for all phases (prefill, decode) and all compression methods.
+    3-way:
+        config.compression is None -> prefill
+        config.compression is True -> decode and compress
+        config.compression is False -> decode and no compress
+    Implements group-wise compression to support batched decoding.
+
+    Returns `(key_states, value_states, attention_mask)`. The mask is replaced by one derived
+    from our own validity bookkeeping whenever padding is present, because HuggingFace's mask
+    stops describing the cache layout the moment compression shrinks it.
+    """
+    update_cache = getattr(self.config, "update_kv", True) is True
+
+    step_valid = getattr(past_key_value, "step_valid_lengths", None)
+
+    def compress(keys, values, valid_lengths):
+        if not padding_present(valid_lengths, keys.shape[2]):
+            outputs = self.kv_cluster.update_kv(keys, cached_queries, values)
+            return outputs, valid_lengths.new_full((keys.shape[0],), outputs[0].shape[2])
+        return compress_by_length_group(
+            self.kv_cluster.update_kv,
+            valid_lengths,
+            keys,
+            cached_queries,
+            values,
+        )
+
+    # Prefill branch
+    # we compress if valid length exceeds the budget, but we only update the cache.
+    # The attention is computed using the *uncompressed* cache.
+    if self.config.compression is None:
+        attn_valid = step_valid = _valid_or_full(step_valid, key_states)
+        if update_cache:
+            outputs, cache_valid = compress(key_states, value_states, step_valid)
+            past_key_value.update(outputs[0], outputs[1], self.layer_idx, cache_kwargs)
+        else:
+            past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            cache_valid = step_valid
+
+    # Decoding branch, compression fired
+    # Similar to prefill above, we only update the cache after compression,
+    # but the attention is computed using the *uncompressed* cache.
+    elif self.config.compression is True:
+        key_states, value_states = past_key_value.update(
+            key_states, value_states, self.layer_idx, cache_kwargs
+        )
+        step_valid = _valid_or_full(step_valid, key_states)
+        outputs, compressed_valid = compress(key_states, value_states, step_valid)
+        attn_valid = step_valid  # This is for uncompressed tensors (for attention)
+        if update_cache:
+            past_key_value.key_cache[self.layer_idx] = outputs[0]
+            past_key_value.value_cache[self.layer_idx] = outputs[1]
+            cache_valid = compressed_valid
+        else:
+            cache_valid = step_valid
+
+    # Decoding branch, compression not fired
+    else:
+        key_states, value_states = past_key_value.update(
+            key_states, value_states, self.layer_idx, cache_kwargs
+        )
+        cache_valid = attn_valid = _valid_or_full(step_valid, key_states)
+
+    # every layer computes the same thing here, so writing it unconditionally is idempotent
+    past_key_value.kv_valid_lengths = cache_valid  # this is for caching, so takes effect from next decoding step.
+
+    if getattr(past_key_value, "has_padding", False):
+        # Rebuild the mask for the whole generation, not just while some row still has padding.
+        # HuggingFace slices `attention_mask[:, :kv_len]` from the FRONT, so the moment
+        # compression shrinks the cache that slice lands on the prompt's leading padding zeros
+        # instead of the real window -- wrong even for a row that has since become dense. (An
+        # all-ones mask is immune, which is why the unpadded path never needed this.)
+        attention_mask = build_additive_attention_mask(
+            attn_valid, key_states.shape[2], q_len, key_states.dtype, key_states.device
+        )
+
+    return key_states, value_states, attention_mask
+
 
 def LlamaAttention_init(
     self, config: LlamaConfig, layer_idx: int, compression_config: dict
@@ -127,49 +223,16 @@ def LlamaAttention_forward(
 
         # =============== decoding-time compression start ===============
         cached_queries = past_key_value.query_cache[self.layer_idx]
-        if self.config.compression is None:
-            key_states_compress, value_states_compress = self.kv_cluster.update_kv(
-                key_states,
-                cached_queries,  # Use cached queries instead of current query
-                value_states,
-            )
-
-            if self.config.update_kv is True:
-                past_key_value.update(
-                    key_states_compress,
-                    value_states_compress,
-                    self.layer_idx,
-                    cache_kwargs,
-                )
-            else:
-                past_key_value.update(
-                    key_states,
-                    value_states,
-                    self.layer_idx,
-                    cache_kwargs,
-                )
-
-        elif self.config.compression is True:
-            key_states, value_states = past_key_value.update(
-                key_states,
-                value_states,
-                self.layer_idx,
-                cache_kwargs,
-            )
-
-            key_states_compress, value_states_compress = self.kv_cluster.update_kv(
-                key_states,
-                cached_queries,  # Use cached queries instead of current query
-                value_states,
-            )
-
-            if self.config.update_kv is True:
-                past_key_value.key_cache[self.layer_idx] = key_states_compress
-                past_key_value.value_cache[self.layer_idx] = value_states_compress
-        else:
-            key_states, value_states = past_key_value.update(
-                key_states, value_states, self.layer_idx, cache_kwargs
-            )
+        key_states, value_states, attention_mask = _compression_step(
+            self,
+            past_key_value,
+            key_states,
+            value_states,
+            cached_queries,
+            cache_kwargs,
+            attention_mask,
+            query_states.shape[2],
+        )
         # =============== decoding-time compression end ===============
 
     attention_interface: Callable = eager_attention_forward
@@ -285,48 +348,16 @@ def Qwen2Attention_forward(
 
         # =============== decoding-time compression start ===============
         cached_queries = past_key_value.query_cache[self.layer_idx]
-        if self.config.compression is None:
-            key_states_compress, value_states_compress = self.kv_cluster.update_kv(
-                key_states,
-                cached_queries,  # Use cached queries instead of current query
-                value_states,
-            )
-
-            if self.config.update_kv is True:
-                past_key_value.update(
-                    key_states_compress,
-                    value_states_compress,
-                    self.layer_idx,
-                    cache_kwargs,
-                )
-            else:
-                past_key_value.update(
-                    key_states,
-                    value_states,
-                    self.layer_idx,
-                    cache_kwargs,
-                )
-
-        elif self.config.compression is True:
-            key_states, value_states = past_key_value.update(
-                key_states,
-                value_states,
-                self.layer_idx,
-                cache_kwargs,
-            )
-
-            key_states_compress, value_states_compress = self.kv_cluster.update_kv(
-                key_states,
-                cached_queries,  # Use cached queries instead of current query
-                value_states,
-            )
-            if self.config.update_kv is True:
-                past_key_value.key_cache[self.layer_idx] = key_states_compress
-                past_key_value.value_cache[self.layer_idx] = value_states_compress
-        else:
-            key_states, value_states = past_key_value.update(
-                key_states, value_states, self.layer_idx, cache_kwargs
-            )
+        key_states, value_states, attention_mask = _compression_step(
+            self,
+            past_key_value,
+            key_states,
+            value_states,
+            cached_queries,
+            cache_kwargs,
+            attention_mask,
+            query_states.shape[2],
+        )
         # =============== decoding-time compression end ===============
 
     sliding_window = None
@@ -460,40 +491,16 @@ def Qwen3Attention_forward(
 
         # =============== decoding-time compression start ===============
         cached_queries = past_key_value.query_cache[self.layer_idx]
-        if self.config.compression is None:
-            key_states_compress, value_states_compress = self.kv_cluster.update_kv(
-                key_states,
-                cached_queries,  # Use cached queries instead of current query
-                value_states,
-            )
-
-            past_key_value.update(
-                key_states_compress,
-                value_states_compress,
-                self.layer_idx,
-                cache_kwargs,
-            )
-
-        elif self.config.compression is True:
-            key_states, value_states = past_key_value.update(
-                key_states,
-                value_states,
-                self.layer_idx,
-                cache_kwargs,
-            )
-
-            key_states_compress, value_states_compress = self.kv_cluster.update_kv(
-                key_states,
-                cached_queries,  # Use cached queries instead of current query
-                value_states,
-            )
-
-            past_key_value.key_cache[self.layer_idx] = key_states_compress
-            past_key_value.value_cache[self.layer_idx] = value_states_compress
-        else:
-            key_states, value_states = past_key_value.update(
-                key_states, value_states, self.layer_idx, cache_kwargs
-            )
+        key_states, value_states, attention_mask = _compression_step(
+            self,
+            past_key_value,
+            key_states,
+            value_states,
+            cached_queries,
+            cache_kwargs,
+            attention_mask,
+            query_states.shape[2],
+        )
         # =============== decoding-time compression end ===============
 
     attention_interface: Callable = eager_attention_forward
@@ -553,14 +560,81 @@ def CausalLM_forward(
     )
 
     # sample-level statistics
-    if len(past_key_values) == 0:
+    is_prefill = past_key_values is None or len(past_key_values) == 0
+    if is_prefill:
         if self.config.compression_content == "think":
             self.after_think = False
+        self.config.compression = None  # None means prefill
 
-    if not hasattr(self, "length"):
+    # self.length drives the `step_length` compression trigger
+    # (is_newline = self.length % divide_length == 0). It MUST reset at every
+    # prefill: left running across samples it keeps accumulating, so the phase
+    # of the every-divide_length trigger depends on the total token count of
+    # all preceding samples. The trigger frequency stayed correct but which
+    # absolute step it fired on became order-dependent, making runs
+    # irreproducible under any change to dataset order or fraction.
+    #
+    # Note that `self.length` starts at the *prompt* length, so the trigger phase is
+    # `prompt_len % divide_length`. With a padded batch the prompt length is the *padded*
+    # length, which makes a row's compression schedule depend on which other prompts shared
+    # its batch. `divide_method="generated_length"` below avoids that entirely.
+    if is_prefill or not hasattr(self, "length"):
         self.length = input_ids.shape[1]
+        self.generated_length = 0
     else:
         self.length += input_ids.shape[1]
+        self.generated_length += input_ids.shape[1]
+
+    # =============== batched-decoding bookkeeping start ===============
+    # `step_valid_lengths` tells the layers how much of each row of the (shared, physical) KV
+    # tensors is real content this step; it stays constant for the whole forward. The layers
+    # write back `kv_valid_lengths` describing the cache they leave behind. See rkv/batching.py.
+    if past_key_values is not None:
+        batch_size = input_ids.shape[0]
+        if is_prefill:
+            if attention_mask is not None and attention_mask.dim() == 2:
+                step_valid = attention_mask.sum(dim=-1).to(torch.long)
+            else:
+                step_valid = torch.full(
+                    (batch_size,), input_ids.shape[1], dtype=torch.long, device=input_ids.device
+                )
+
+            if padding_present(step_valid, input_ids.shape[1]):
+                # a padded batch needs an explicit additive mask, which flash-attention has no
+                # parameter for at all
+                if "flash" in self.config._attn_implementation:
+                    logger.warning_once(
+                        "Batches of unequal-length prompts require an additive attention mask, which "
+                        "flash_attention_2 cannot accept; falling back to sdpa for this run. Pass "
+                        "equal-length prompts (or batch_size=1) to keep flash-attention."
+                    )
+                    self.config._attn_implementation = "sdpa"
+
+            # Latched for the whole sequence, not re-derived per step: once the prompt carried
+            # padding, HuggingFace's mask is unusable from the first compression onwards (see
+            # _compression_step), even after every row has become dense again.
+            past_key_values.has_padding = bool(padding_present(step_valid, input_ids.shape[1]))
+
+            # These don't work for batched decoding
+            if batch_size > 1:
+                # both of these decide compression for the whole batch from row 0's predicted
+                # token, which is silently wrong rather than merely approximate once bsz > 1
+                if self.config.divide_method == "newline":
+                    raise NotImplementedError(
+                        "divide_method='newline' decides the compression step from row 0's predicted "
+                        "token only, so it cannot drive a batch. Use divide_method='generated_length' "
+                        "(batch-wide and prompt-length independent) or 'step_length', or batch_size=1."
+                    )
+                if self.config.compression_content == "think":
+                    raise NotImplementedError(
+                        "compression_content='think' tracks the </think> transition from row 0 only, "
+                        "so it cannot drive a batch. Use compression_content='all' or batch_size=1."
+                    )
+        # decoding branch
+        else:
+            step_valid = past_key_values.kv_valid_lengths + input_ids.shape[1]
+        past_key_values.step_valid_lengths = step_valid
+    # =============== batched-decoding bookkeeping end =================
 
     # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
     outputs = self.model(
@@ -599,6 +673,12 @@ def CausalLM_forward(
         is_newline = predicted_token_ids[0].cpu().item() in self.newline_token_ids
     elif self.config.divide_method == "step_length":
         is_newline = self.length % self.config.divide_length == 0
+    elif self.config.divide_method == "generated_length":
+        # This makes the eviction result agnostic to the batch that potentially contains padding
+        is_newline = (
+            self.generated_length > 0
+            and self.generated_length % self.config.divide_length == 0
+        )
     else:
         raise ValueError(f"Invalid divide_method: {self.config.divide_method}")
 
