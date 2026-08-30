@@ -15,7 +15,7 @@ dataset2key = {
     "math": ["problem", "answer"],
 }
 
-dataset2max_length = {
+dataset2max_new_tokens = {
     "gsm8k": 8192,
     "aime24": 32768,
     "math": 16384,
@@ -49,7 +49,7 @@ def main(args):
             question = example[question_key]
             example["question"] = question
             prompt = prompt_template.format(**example)
-            if args.use_chat_template:
+            if args.apply_chat_template:
                 # R1-distill models are trained to reason inside the chat
                 # format (<think> after the assistant turn); a plain-text
                 # prompt makes them exit thinking immediately and lowers
@@ -58,12 +58,23 @@ def main(args):
                     [{"role": "user", "content": prompt}],
                     tokenize=False,
                     add_generation_prompt=True,
+                    enable_thinking=args.enable_thinking,
                 )
 
             example["prompt"] = prompt
             example["index"] = index
             prompts.append(prompt)
             test_data.append(example)
+
+    # Subset sampling for quick testing. `test_data` is deliberately left at full
+    # length: it is only ever indexed by sample_idx, which is bounded by len(prompts).
+    prompts = prompts[: int(args.fraction * len(prompts))]
+
+    # Print some samples for sanity check
+    for prompt in prompts[:5]:
+        print("#" * 100)
+        print(prompt)
+        print("#" * 100)
 
 
     for i in tqdm(range(0, len(prompts), args.eval_batch_size)):
@@ -73,14 +84,14 @@ def main(args):
             padding="longest",
             return_tensors="pt",
             # the chat template already inserts BOS/special tokens
-            add_special_tokens=not args.use_chat_template,
+            add_special_tokens=not args.apply_chat_template,
         ).to("cuda")
 
         prefill_lengths = tokenized_prompts["attention_mask"].sum(dim=1).tolist()
         prompt_sequence_length = tokenized_prompts.input_ids.shape[1]
 
         generation_kwargs = {
-            "max_length": args.max_length,
+            "max_new_tokens": args.max_new_tokens,
             "do_sample": args.do_sample,
             "num_beams": 1,
             "num_return_sequences": args.num_return_sequences,
@@ -147,7 +158,7 @@ def parse_arguments():
     parser.add_argument("--dataset_path", type=str)
     parser.add_argument("--save_path", type=str)
     parser.add_argument("--model_path", type=str)
-    parser.add_argument("--max_length", type=int, default=-1)
+    parser.add_argument("--max_new_tokens", type=int, default=-1)
     parser.add_argument("--eval_batch_size", type=int, default=1)
     parser.add_argument(
         "--attn_implementation",
@@ -195,7 +206,7 @@ def parse_arguments():
         help="enable sampling; paper-style reproduction uses this with temperature 0.6 and top_p 0.95",
     )
     parser.add_argument(
-        "--use_chat_template",
+        "--apply_chat_template",
         action="store_true",
         help="wrap the prompt with tokenizer.apply_chat_template; recommended "
         "for DeepSeek-R1-distill models, which only enter their trained "
@@ -204,6 +215,19 @@ def parse_arguments():
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--num_return_sequences", type=int, default=1)
+    parser.add_argument(
+        "--fraction",
+        type=float,
+        default=1.0,
+        help="evaluate only the first fraction of the dataset, for quick testing",
+    )
+    parser.add_argument(
+        "--enable_thinking",
+        action="store_true",
+        help="passed through to apply_chat_template as enable_thinking=; only takes "
+        "effect together with --apply_chat_template, and only for models whose "
+        "template reads it (e.g. Qwen3)",
+    )
 
     return parser.parse_args()
 
@@ -215,7 +239,7 @@ if __name__ == "__main__":
     set_seed(args.seed)
 
     args.dataset_name = args.dataset_path.split("/")[-1].split(".")[0]
-    if args.max_length == -1: args.max_length = dataset2max_length[args.dataset_name]
+    if args.max_new_tokens == -1: args.max_new_tokens = dataset2max_new_tokens[args.dataset_name]
 
     # ====== build compression config ======
     compression_config = {
