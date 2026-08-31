@@ -172,13 +172,21 @@ def parse_arguments():
         "--method",
         type=str,
         default=None,
-        choices=["rkv", "fullkv", "snapkv", "streamingllm", "h2o"],
+        choices=["rkv", "fullkv", "snapkv", "streamingllm", "h2o", "covariance_merge"],
     )
     parser.add_argument("--kv_budget", type=int, default=None)
     parser.add_argument("--window_size", type=int, default=8)
     parser.add_argument("--first_tokens", type=int, default=4)
     parser.add_argument("--mix_lambda", type=float, default=0.1)
     parser.add_argument("--retain_ratio", type=float, default=0.2)
+    parser.add_argument(
+        "--merge_threshold",
+        type=float,
+        default=1.0,
+        help="covariance_merge only: merge a source into its nearest target only if the predicted "
+        "variance of their attention-logit gap, scaling^2 * dk^T Sigma dk, is <= this. Units are "
+        "squared logits, so sqrt is a predicted std deviation of the gap in nats.",
+    )
     parser.add_argument("--update_kv", type=bool, default=True)
     parser.add_argument(
         "--retain_direction", type=str, default="last", choices=["last", "first"]
@@ -193,6 +201,27 @@ def parse_arguments():
         help="generated_length mod divide length is the compression clock. This is batch-agnostic"
     )
     parser.add_argument("--divide_length", type=int, default=128)
+    parser.add_argument(
+        "--ema_half_life",
+        type=int,
+        default=64,
+        help="covariance_merge only: half-life H (in steps) of the EMA over query moments; the "
+        "decay is 2^(-1/H). H=64 was best in the qstats estimator sweep.",
+    )
+    parser.add_argument(
+        "--future_horizon",
+        type=int,
+        default=128,
+        help="covariance_merge only: number of future RoPE frames P the query moments are averaged "
+        "over. P=128 was best in the qstats estimator sweep.",
+    )
+    parser.add_argument(
+        "--future_decay",
+        type=float,
+        default=1.0,
+        help="covariance_merge only: weight on future offset h is future_decay^(h-1), normalized. "
+        "1.0 is uniform and is the default -- recency weighting only hurt in the sweep.",
+    )
     parser.add_argument(
         "--compression_content",
         type=str,
@@ -251,6 +280,7 @@ if __name__ == "__main__":
             "retain_ratio": args.retain_ratio,
             "retain_direction": args.retain_direction,
             "first_tokens": args.first_tokens,
+            "merge_threshold": args.merge_threshold,
         },
         "compression": None,
         "update_kv": args.update_kv
@@ -259,6 +289,10 @@ if __name__ == "__main__":
         "divide_method": args.divide_method,
         "divide_length": args.divide_length,
         "compression_content": args.compression_content,
+        # read by CausalLM_forward / the attention layers for covariance_merge
+        "ema_half_life": args.ema_half_life,
+        "future_horizon": args.future_horizon,
+        "future_decay": args.future_decay,
     }
 
     tokenizer = AutoTokenizer.from_pretrained(

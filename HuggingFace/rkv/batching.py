@@ -42,11 +42,21 @@ def build_additive_attention_mask(valid_lengths, physical_len, q_len, dtype, dev
     return mask.masked_fill_(~allowed, torch.finfo(dtype).min)
 
 
-def compress_by_length_group(update_fn, valid_lengths, key_states, cached_queries, value_states):
+def compress_by_length_group(
+    update_fn, valid_lengths, key_states, cached_queries, value_states,
+    extras=(), extra_pad_values=(), head_extras=(),
+):
     """Run `update_fn` per length-group on padding-free slices, reassemble right-aligned.
 
-    `update_fn(keys, queries, values) -> (keys, values)` is the kernel's own `update_kv`, called
-    completely unmodified.
+    `update_fn(keys, queries, values, *extras, *head_extras) -> (keys, values, *extras)` is the
+    kernel's own `update_kv`, called completely unmodified.
+
+    Two metadata channels, because they are indexed differently:
+      * `extras` -- PER SLOT, shaped (bsz, n_kv_heads, physical_len). Row-selected *and*
+        sequence-sliced alongside the keys, and returned re-indexed to the compressed cache, with
+        `extra_pad_values[i]` written into any padding. CovarianceMerge's `beta`/`n`.
+      * `head_extras` -- PER (row, KV head), no sequence axis. Only row-selected, never sliced and
+        never returned. CovarianceMerge's future-query `mu`/`Sigma`.
 
     Returns `(outputs_tuple, new_valid_lengths)`.
     """
@@ -68,6 +78,8 @@ def compress_by_length_group(update_fn, valid_lengths, key_states, cached_querie
             key_states[rows_idx][:, :, start:, :],
             cached_queries[rows_idx],
             value_states[rows_idx][:, :, start:, :],
+            *[extra[rows_idx][:, :, start:] for extra in extras],
+            *[head[rows_idx] for head in head_extras],
         )
         if not isinstance(outputs, tuple):
             raise TypeError("update_kv must return a tuple of tensors")
@@ -78,6 +90,10 @@ def compress_by_length_group(update_fn, valid_lengths, key_states, cached_querie
     out_len = max(new_lengths)
     out_key = key_states.new_zeros(bsz, n_kv_heads, out_len, head_dim)
     out_value = value_states.new_zeros(bsz, n_kv_heads, out_len, head_dim)
+    out_extras = [
+        extra.new_full((bsz, n_kv_heads, out_len), pad_value)
+        for extra, pad_value in zip(extras, extra_pad_values)
+    ]
 
     # prepare compressed key and value to return
     for rows_idx, outputs in per_group:
@@ -85,6 +101,8 @@ def compress_by_length_group(update_fn, valid_lengths, key_states, cached_querie
         start = out_len - group_len
         out_key[rows_idx, :, start:, :] = outputs[0]
         out_value[rows_idx, :, start:, :] = outputs[1]
+        for out_extra, group_extra in zip(out_extras, outputs[2:]):
+            out_extra[rows_idx, :, start:] = group_extra
 
     new_valid_lengths = torch.tensor(new_lengths, dtype=valid_lengths.dtype, device=device)
-    return (out_key, out_value), new_valid_lengths
+    return (out_key, out_value, *out_extras), new_valid_lengths

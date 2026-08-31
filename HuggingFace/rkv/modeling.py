@@ -6,6 +6,7 @@ from transformers.processing_utils import Unpack
 from transformers.models.llama.modeling_llama import (
     apply_rotary_pos_emb,
     eager_attention_forward,
+    repeat_kv,
 )
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
@@ -26,7 +27,15 @@ from .compression import (
     SnapKV,
     StreamingLLM,
     H2O,
-    AnalysisKV
+    AnalysisKV,
+    CovarianceMerge,
+)
+from .query_moments import (
+    assert_rope_composes,
+    beta_from_half_life,
+    build_future_rope_operator,
+    read_future_moments,
+    update_query_moments,
 )
 
 KV_COMPRESSION_MAP = {
@@ -34,10 +43,94 @@ KV_COMPRESSION_MAP = {
     "snapkv": SnapKV,
     "streamingllm": StreamingLLM,
     "h2o": H2O,
-    "analysiskv": AnalysisKV
+    "analysiskv": AnalysisKV,
+    "covariance_merge": CovarianceMerge,
 }
 
 logger = logging.get_logger(__name__)
+
+
+
+def covariance_merge_eager_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs,
+):
+    """
+    transformers' `eager_attention_forward` plus one addition: the per-KV-slot additive logit bias
+    `module.merge_beta` (bsz, num_kv_heads, kv_len), folded in before the softmax. That bias is what
+    makes attending to a merged centroid approximate attending to all of its members.
+
+    `merge_beta` is always sized to whatever this forward actually attends over, which is the
+    *uncompressed* cache on a step where compression fires -- see `_compression_step`.
+    """
+    key_states = repeat_kv(key, module.num_key_value_groups)
+    value_states = repeat_kv(value, module.num_key_value_groups)
+
+    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask[:, :, :, : key_states.shape[-2]]
+
+    beta = getattr(module, "merge_beta", None)
+    if beta is not None:
+        # (bsz, num_kv_heads, kv_len) -> (bsz, num_heads, 1, kv_len): broadcast over the query heads
+        # of a GQA group (they share the slot, hence the bias) and over every query position here
+        bias = beta.repeat_interleave(module.num_key_value_groups, dim=1).unsqueeze(2)
+        attn_weights = attn_weights + bias.to(attn_weights.dtype)
+
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    attn_output = torch.matmul(attn_weights, value_states).transpose(1, 2).contiguous()
+    return attn_output, attn_weights
+
+
+def _merge_metadata_for_step(self, past_key_value, key_states):
+    """`(beta, n)` for CovarianceMerge, extended with a fresh `(0, 1)` slot per token added this
+    forward -- i.e. mirroring `cat(cached, new)`, so the pair stays index-aligned with the
+    post-`update()` cache. Must be called BEFORE that update.
+
+    Stored on `past_key_value.beta_cache` / `.n_cache`, dicts keyed by layer_idx exactly like the
+    pre-existing `query_cache`, so they reset per `generate()` call for free.
+    """
+    if not hasattr(past_key_value, "beta_cache"):
+        past_key_value.beta_cache = {}
+        past_key_value.n_cache = {}
+    beta_new = key_states.new_zeros(*key_states.shape[:3], dtype=torch.float32)
+    n_new = key_states.new_ones(*key_states.shape[:3], dtype=torch.float32)
+    if self.layer_idx not in past_key_value.beta_cache:
+        return beta_new, n_new
+    return (
+        torch.cat([past_key_value.beta_cache[self.layer_idx], beta_new], dim=2),
+        torch.cat([past_key_value.n_cache[self.layer_idx], n_new], dim=2),
+    )
+
+
+def _store_merge_metadata(self, past_key_value, metadata, is_merge):
+    if is_merge:
+        past_key_value.beta_cache[self.layer_idx] = metadata[0]
+        past_key_value.n_cache[self.layer_idx] = metadata[1]
+
+
+def _update_merge_moments(self, past_key_value, prerope_query):
+    """Fold this forward's pre-RoPE queries into the layer's future-query EMA. Runs every step;
+    CovarianceMerge needs no recent-query window as a result."""
+    valid = _valid_or_full(
+        getattr(past_key_value, "step_valid_lengths", None), prerope_query
+    )
+    update_query_moments(
+        past_key_value,
+        self.layer_idx,
+        prerope_query,
+        self.config.num_key_value_heads,
+        beta_from_half_life(getattr(self.config, "ema_half_life", 64)),
+        valid,
+        is_prefill=self.config.compression is None,
+    )
 
 
 def _valid_or_full(valid_lengths, tensor):
@@ -63,12 +156,32 @@ def _compression_step(self, past_key_value, key_states, value_states, cached_que
     stops describing the cache layout the moment compression shrinks it.
     """
     update_cache = getattr(self.config, "update_kv", True) is True
+    is_merge = isinstance(self.kv_cluster, CovarianceMerge)
+
+    # CovarianceMerge carries two kinds of side state through the generic channels in
+    # rkv/batching.py: per-slot (beta, n), which must be re-indexed exactly like the keys, and
+    # per-(row, KV head) (mu, Sigma), which has no sequence axis. No other kernel is affected.
+    extras, extra_pads, head_extras = (), (), ()
+    if is_merge:
+        extras = _merge_metadata_for_step(self, past_key_value, key_states)
+        # padded beta is inert (those slots are masked out anyway); padded mass 1 keeps every padded
+        # slot a well-formed singleton rather than a divide-by-zero waiting to happen
+        extra_pads = (0.0, 1.0)
 
     step_valid = getattr(past_key_value, "step_valid_lengths", None)
 
     def compress(keys, values, valid_lengths):
+        # Read the future-query moments here rather than above: this runs only on steps that
+        # actually compress, so the (bsz, Hkv, D, D) projection is skipped on every other step.
+        head_extras = (
+            read_future_moments(past_key_value, self.layer_idx, past_key_value.future_rope)
+            if is_merge
+            else ()
+        )
         if not padding_present(valid_lengths, keys.shape[2]):
-            outputs = self.kv_cluster.update_kv(keys, cached_queries, values)
+            outputs = self.kv_cluster.update_kv(
+                keys, cached_queries, values, *extras, *head_extras
+            )
             return outputs, valid_lengths.new_full((keys.shape[0],), outputs[0].shape[2])
         return compress_by_length_group(
             self.kv_cluster.update_kv,
@@ -76,6 +189,9 @@ def _compression_step(self, past_key_value, key_states, value_states, cached_que
             keys,
             cached_queries,
             values,
+            extras=extras,
+            extra_pad_values=extra_pads,
+            head_extras=head_extras,
         )
 
     # Prefill branch
@@ -83,12 +199,15 @@ def _compression_step(self, past_key_value, key_states, value_states, cached_que
     # The attention is computed using the *uncompressed* cache.
     if self.config.compression is None:
         attn_valid = step_valid = _valid_or_full(step_valid, key_states)
+        attn_extras = extras
         if update_cache:
             outputs, cache_valid = compress(key_states, value_states, step_valid)
             past_key_value.update(outputs[0], outputs[1], self.layer_idx, cache_kwargs)
+            _store_merge_metadata(self, past_key_value, outputs[2:], is_merge)
         else:
             past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
             cache_valid = step_valid
+            _store_merge_metadata(self, past_key_value, extras, is_merge)
 
     # Decoding branch, compression fired
     # Similar to prefill above, we only update the cache after compression,
@@ -100,12 +219,15 @@ def _compression_step(self, past_key_value, key_states, value_states, cached_que
         step_valid = _valid_or_full(step_valid, key_states)
         outputs, compressed_valid = compress(key_states, value_states, step_valid)
         attn_valid = step_valid  # This is for uncompressed tensors (for attention)
+        attn_extras = extras
         if update_cache:
             past_key_value.key_cache[self.layer_idx] = outputs[0]
             past_key_value.value_cache[self.layer_idx] = outputs[1]
             cache_valid = compressed_valid
+            _store_merge_metadata(self, past_key_value, outputs[2:], is_merge)
         else:
             cache_valid = step_valid
+            _store_merge_metadata(self, past_key_value, extras, is_merge)
 
     # Decoding branch, compression not fired
     else:
@@ -113,9 +235,15 @@ def _compression_step(self, past_key_value, key_states, value_states, cached_que
             key_states, value_states, self.layer_idx, cache_kwargs
         )
         cache_valid = attn_valid = _valid_or_full(step_valid, key_states)
+        attn_extras = extras
+        _store_merge_metadata(self, past_key_value, extras, is_merge)
 
     # every layer computes the same thing here, so writing it unconditionally is idempotent
     past_key_value.kv_valid_lengths = cache_valid  # this is for caching, so takes effect from next decoding step.
+
+    if is_merge:
+        # sized to the tensors attention will actually run over this step, NOT the compressed cache
+        self.merge_beta = attn_extras[0]
 
     if getattr(past_key_value, "has_padding", False):
         # Rebuild the mask for the whole generation, not just while some row still has padding.
@@ -170,6 +298,13 @@ def LlamaAttention_init(
     self.kv_cluster = KV_COMPRESSION_MAP[compression_config["method"]](
         **compression_config["method_config"]
     )
+    if isinstance(self.kv_cluster, CovarianceMerge):
+        # The mask FORMAT the upstream model code builds is keyed off `_attn_implementation`
+        # (bool for sdpa, additive float for eager), independently of which attention function we
+        # install below. Overriding only the function leaves eager reading an sdpa-shaped mask,
+        # which silently produces immediate-EOS garbage. Force eager so the two agree.
+        self.config._attn_implementation = "eager"
+        assert_rope_composes(self.config)
     # =============== New logic end =================
 
 def LlamaAttention_forward(
@@ -189,16 +324,26 @@ def LlamaAttention_forward(
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
     cos, sin = position_embeddings
+    # kept for CovarianceMerge's future-query moments, which model the pre-RoPE query and
+    # apply the rotation for future positions themselves (see rkv/query_moments.py)
+    prerope_query = query_states
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
     if past_key_value is not None:
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
 
         # =============== Enable Query Cache ============
-        if not hasattr(past_key_value, "query_cache"):
-            past_key_value.query_cache = {}
+        # CovarianceMerge keeps online future-query moments instead of a recent-query window, so the
+        # window is not maintained for it at all.
+        if isinstance(self.kv_cluster, CovarianceMerge):
+            _update_merge_moments(self, past_key_value, prerope_query)
+            query_window_needed = False
+        else:
+            query_window_needed = True
+            if not hasattr(past_key_value, "query_cache"):
+                past_key_value.query_cache = {}
 
-        if self.layer_idx not in past_key_value.query_cache:
+        if query_window_needed and (self.layer_idx not in past_key_value.query_cache):
             # prefill stage
             bsz, n_heads, _, head_dim = query_states.shape
             past_key_value.query_cache[self.layer_idx] = torch.empty(
@@ -207,7 +352,7 @@ def LlamaAttention_forward(
             past_key_value.query_cache[self.layer_idx] = query_states[
                 :, :, -self.config.method_config["window_size"] :, :
             ]
-        else:
+        elif query_window_needed:
             # Add current query to cache
             past_key_value.query_cache[self.layer_idx] = torch.cat(
                 (past_key_value.query_cache[self.layer_idx], query_states), dim=2
@@ -222,7 +367,11 @@ def LlamaAttention_forward(
         # =============== Enable Query Cache end =========
 
         # =============== decoding-time compression start ===============
-        cached_queries = past_key_value.query_cache[self.layer_idx]
+        cached_queries = (
+            query_states
+            if isinstance(self.kv_cluster, CovarianceMerge)
+            else past_key_value.query_cache[self.layer_idx]
+        )
         key_states, value_states, attention_mask = _compression_step(
             self,
             past_key_value,
@@ -236,7 +385,9 @@ def LlamaAttention_forward(
         # =============== decoding-time compression end ===============
 
     attention_interface: Callable = eager_attention_forward
-    if self.config._attn_implementation != "eager":
+    if isinstance(self.kv_cluster, CovarianceMerge):
+        attention_interface = covariance_merge_eager_attention_forward
+    elif self.config._attn_implementation != "eager":
         if self.config._attn_implementation == "sdpa" and kwargs.get(
             "output_attentions", False
         ):
@@ -295,6 +446,13 @@ def Qwen2Attention_init(
     self.kv_cluster = KV_COMPRESSION_MAP[compression_config["method"]](
         **compression_config["method_config"]
     )
+    if isinstance(self.kv_cluster, CovarianceMerge):
+        # The mask FORMAT the upstream model code builds is keyed off `_attn_implementation`
+        # (bool for sdpa, additive float for eager), independently of which attention function we
+        # install below. Overriding only the function leaves eager reading an sdpa-shaped mask,
+        # which silently produces immediate-EOS garbage. Force eager so the two agree.
+        self.config._attn_implementation = "eager"
+        assert_rope_composes(self.config)
     # =============== New logic end =================
 
 def Qwen2Attention_forward(
@@ -314,16 +472,26 @@ def Qwen2Attention_forward(
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
     cos, sin = position_embeddings
+    # kept for CovarianceMerge's future-query moments, which model the pre-RoPE query and
+    # apply the rotation for future positions themselves (see rkv/query_moments.py)
+    prerope_query = query_states
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
     if past_key_value is not None:
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
 
         # =============== Enable Query Cache ============
-        if not hasattr(past_key_value, "query_cache"):
-            past_key_value.query_cache = {}
+        # CovarianceMerge keeps online future-query moments instead of a recent-query window, so the
+        # window is not maintained for it at all.
+        if isinstance(self.kv_cluster, CovarianceMerge):
+            _update_merge_moments(self, past_key_value, prerope_query)
+            query_window_needed = False
+        else:
+            query_window_needed = True
+            if not hasattr(past_key_value, "query_cache"):
+                past_key_value.query_cache = {}
 
-        if self.layer_idx not in past_key_value.query_cache:
+        if query_window_needed and (self.layer_idx not in past_key_value.query_cache):
             # prefill stage
             bsz, n_heads, _, head_dim = query_states.shape
             past_key_value.query_cache[self.layer_idx] = torch.empty(
@@ -332,7 +500,7 @@ def Qwen2Attention_forward(
             past_key_value.query_cache[self.layer_idx] = query_states[
                 :, :, -self.config.method_config["window_size"] :, :
             ]
-        else:
+        elif query_window_needed:
             # Add current query to cache
             past_key_value.query_cache[self.layer_idx] = torch.cat(
                 (past_key_value.query_cache[self.layer_idx], query_states), dim=2
@@ -347,7 +515,11 @@ def Qwen2Attention_forward(
         # =============== Enable Query Cache end ===============
 
         # =============== decoding-time compression start ===============
-        cached_queries = past_key_value.query_cache[self.layer_idx]
+        cached_queries = (
+            query_states
+            if isinstance(self.kv_cluster, CovarianceMerge)
+            else past_key_value.query_cache[self.layer_idx]
+        )
         key_states, value_states, attention_mask = _compression_step(
             self,
             past_key_value,
@@ -369,7 +541,9 @@ def Qwen2Attention_forward(
         sliding_window = self.config.sliding_window
 
     attention_interface: Callable = eager_attention_forward
-    if self.config._attn_implementation != "eager":
+    if isinstance(self.kv_cluster, CovarianceMerge):
+        attention_interface = covariance_merge_eager_attention_forward
+    elif self.config._attn_implementation != "eager":
         if self.config._attn_implementation == "sdpa" and kwargs.get(
             "output_attentions", False
         ):
@@ -437,6 +611,9 @@ def Qwen3Attention_init(
         self.kv_cluster = KV_COMPRESSION_MAP[compression_config["method"]](
             **compression_config["method_config"]
         )
+        if isinstance(self.kv_cluster, CovarianceMerge):
+            self.config._attn_implementation = "eager"
+            assert_rope_composes(self.config)
         # =============== New logic end =================
 
 def Qwen3Attention_forward(
@@ -456,6 +633,9 @@ def Qwen3Attention_forward(
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
     cos, sin = position_embeddings
+    # kept for CovarianceMerge's future-query moments, which model the pre-RoPE query and
+    # apply the rotation for future positions themselves (see rkv/query_moments.py)
+    prerope_query = query_states
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
 
@@ -463,10 +643,17 @@ def Qwen3Attention_forward(
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
 
         # =============== Enable Query Cache ============
-        if not hasattr(past_key_value, "query_cache"):
-            past_key_value.query_cache = {}
+        # CovarianceMerge keeps online future-query moments instead of a recent-query window, so the
+        # window is not maintained for it at all.
+        if isinstance(self.kv_cluster, CovarianceMerge):
+            _update_merge_moments(self, past_key_value, prerope_query)
+            query_window_needed = False
+        else:
+            query_window_needed = True
+            if not hasattr(past_key_value, "query_cache"):
+                past_key_value.query_cache = {}
 
-        if self.layer_idx not in past_key_value.query_cache:
+        if query_window_needed and (self.layer_idx not in past_key_value.query_cache):
             # prefill stage
             bsz, n_heads, _, head_dim = query_states.shape
             past_key_value.query_cache[self.layer_idx] = torch.empty(
@@ -475,7 +662,7 @@ def Qwen3Attention_forward(
             past_key_value.query_cache[self.layer_idx] = query_states[
                 :, :, -self.config.method_config["window_size"] :, :
             ]
-        else:
+        elif query_window_needed:
             # Add current query to cache
             past_key_value.query_cache[self.layer_idx] = torch.cat(
                 (past_key_value.query_cache[self.layer_idx], query_states), dim=2
@@ -490,7 +677,11 @@ def Qwen3Attention_forward(
         # =============== Enable Query Cache end =========
 
         # =============== decoding-time compression start ===============
-        cached_queries = past_key_value.query_cache[self.layer_idx]
+        cached_queries = (
+            query_states
+            if isinstance(self.kv_cluster, CovarianceMerge)
+            else past_key_value.query_cache[self.layer_idx]
+        )
         key_states, value_states, attention_mask = _compression_step(
             self,
             past_key_value,
@@ -504,7 +695,9 @@ def Qwen3Attention_forward(
         # =============== decoding-time compression end ===============
 
     attention_interface: Callable = eager_attention_forward
-    if self.config._attn_implementation != "eager":
+    if isinstance(self.kv_cluster, CovarianceMerge):
+        attention_interface = covariance_merge_eager_attention_forward
+    elif self.config._attn_implementation != "eager":
         if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
             logger.warning_once(
                 "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
@@ -635,6 +828,32 @@ def CausalLM_forward(
             step_valid = past_key_values.kv_valid_lengths + input_ids.shape[1]
         past_key_values.step_valid_lengths = step_valid
     # =============== batched-decoding bookkeeping end =================
+
+    # =============== CovarianceMerge future-query frame start =========
+    # The horizon operator depends only on the RoPE frequencies and each row's current position, so
+    # it is identical for all layers -- build it once here rather than 28 times. `rotary_emb` lives
+    # on the Model, not on the attention layers, so here is also the only place that *can* build it.
+    # Only needed on steps that actually compress; the moments themselves update every step.
+    if (
+        past_key_values is not None
+        and getattr(self.config, "method", None) == "covariance_merge"
+        and self.config.compression is not False
+    ):
+        if position_ids is not None:
+            frame_positions = position_ids
+        else:
+            # cache_position is shared across the batch; broadcast it to one row per sequence
+            frame_positions = cache_position.view(1, -1).expand(input_ids.shape[0], -1)
+        past_key_values.future_rope = build_future_rope_operator(
+            self.model.rotary_emb,
+            frame_positions,
+            getattr(self.config, "future_horizon", 128),
+            getattr(self.config, "future_decay", 1.0),
+            # fp32 reference: rotary_emb returns cos/sin in the reference's dtype, and rounding them
+            # through bf16 before building the horizon coefficients loses precision for free
+            torch.empty(0, dtype=torch.float32, device=input_ids.device),
+        )
+    # =============== CovarianceMerge future-query frame end ===========
 
     # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
     outputs = self.model(
