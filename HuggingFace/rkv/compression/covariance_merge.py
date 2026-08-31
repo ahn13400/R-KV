@@ -1,5 +1,7 @@
 import torch
 
+from .merge_core import constant_gap_merge
+
 
 class CovarianceMerge:
     """
@@ -23,6 +25,12 @@ class CovarianceMerge:
     (mu, Sigma) and each slot's own beta, rather than accumulated as a merge-recursive running
     total `I_C = I_A + I_B`.
     """
+
+    # consumed by rkv/modeling.py: needs (beta, n) per-slot metadata, the future-query moments and
+    # the additive-bias attention path...
+    uses_merge_metadata = True
+    # ...but no recent-query window: the moments are maintained online instead.
+    uses_query_window = False
 
     def __init__(
         self,
@@ -116,59 +124,14 @@ class CovarianceMerge:
         src_q = torch.gather(quad, 1, src_idx_flat)
         src_mu_dot = torch.gather(mu_dot_k, 1, src_idx_flat)
 
-        # ---- nearest surviving target per source, under the covariance quadratic form ----
-        # d(a,b) = a^T Sigma a + b^T Sigma b - 2 a^T Sigma b, avoids materializing (n_remove,
-        # budget, head_dim) pairwise differences
-        cross = torch.einsum("fsd,fde,fke->fsk", src_keys, cov_flat, kept_keys)
-        dist2_raw = src_q.unsqueeze(-1) + kept_q.unsqueeze(1) - 2 * cross
-
-        nearest_dist2_raw, nearest_target = dist2_raw.min(dim=-1)
-        merge_ok = (scaling**2) * nearest_dist2_raw <= self.merge_threshold
-
-        # ---- recursive constant-gap merge: every kept slot absorbs whichever sources
-        # (0, 1, or many) chose it as their nearest target and passed the threshold ----
-        proj_kept = kept_beta + scaling * kept_mu_dot
-        proj_src = src_beta + scaling * src_mu_dot
-
-        src_mass = src_n * merge_ok.float()
-        added_mass = torch.zeros_like(kept_n).scatter_add_(1, nearest_target, src_mass)
-        new_n = kept_n + added_mass
-
-        weighted_src_key = src_keys * src_mass.unsqueeze(-1)
-        added_key_sum = torch.zeros_like(kept_keys).scatter_add_(
-            1, nearest_target.unsqueeze(-1).expand(-1, -1, head_dim), weighted_src_key
+        new_key, new_value, new_beta, new_n = constant_gap_merge(
+            kept_keys=kept_keys, kept_values=kept_values, kept_beta=kept_beta, kept_n=kept_n,
+            kept_quad=kept_q, kept_mu_dot=kept_mu_dot,
+            src_keys=src_keys, src_values=src_values, src_beta=src_beta, src_n=src_n,
+            src_quad=src_q, src_mu_dot=src_mu_dot,
+            cov_flat=cov_flat, mu_flat=mu_flat, scaling=scaling,
+            merge_threshold=self.merge_threshold,
         )
-        new_key = (kept_keys * kept_n.unsqueeze(-1) + added_key_sum) / new_n.unsqueeze(-1)
-
-        neg_inf_where_evicted = torch.where(
-            merge_ok, proj_src, torch.full_like(proj_src, float("-inf"))
-        )
-        max_per_target = torch.full_like(kept_beta, float("-inf")).scatter_reduce(
-            1, nearest_target, neg_inf_where_evicted, reduce="amax", include_self=True
-        )
-        running_max = torch.maximum(proj_kept, max_per_target)
-
-        exp_src = torch.where(
-            merge_ok,
-            torch.exp(proj_src - torch.gather(running_max, 1, nearest_target)),
-            torch.zeros_like(proj_src),
-        )
-        sum_exp_src = torch.zeros_like(kept_beta).scatter_add_(1, nearest_target, exp_src)
-        exp_kept_self = torch.exp(proj_kept - running_max)  # == 1 when no source beats kept's own proj
-        total_exp = exp_kept_self + sum_exp_src
-
-        weighted_src_val = src_values * exp_src.unsqueeze(-1)
-        added_val_sum = torch.zeros_like(kept_values).scatter_add_(
-            1, nearest_target.unsqueeze(-1).expand(-1, -1, head_dim), weighted_src_val
-        )
-        new_value = (kept_values * exp_kept_self.unsqueeze(-1) + added_val_sum) / total_exp.unsqueeze(-1)
-
-        # b_C is *defined* as whatever makes scaling*mu.k_C + b_C exactly equal
-        # logsumexp_j(proj_j) -- exact for this specific k_C by construction, regardless of how
-        # k_C itself was chosen; reduces to the unmerged slot's own beta unchanged when no
-        # source merges into it (running_max==proj_kept, total_exp==1, new_key==kept_keys).
-        lse_proj = running_max + torch.log(total_exp)
-        new_beta = lse_proj - scaling * torch.einsum("fkd,fd->fk", new_key, mu_flat)
 
         new_key = new_key.reshape(bsz, num_kv_heads, self.budget, head_dim).to(key_states.dtype)
         new_value = new_value.reshape(bsz, num_kv_heads, self.budget, head_dim).to(value_states.dtype)

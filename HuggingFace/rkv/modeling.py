@@ -29,6 +29,7 @@ from .compression import (
     H2O,
     AnalysisKV,
     CovarianceMerge,
+    RKVMerge,
 )
 from .query_moments import (
     assert_rope_composes,
@@ -45,6 +46,7 @@ KV_COMPRESSION_MAP = {
     "h2o": H2O,
     "analysiskv": AnalysisKV,
     "covariance_merge": CovarianceMerge,
+    "rkv_merge": RKVMerge,
 }
 
 logger = logging.get_logger(__name__)
@@ -156,7 +158,7 @@ def _compression_step(self, past_key_value, key_states, value_states, cached_que
     stops describing the cache layout the moment compression shrinks it.
     """
     update_cache = getattr(self.config, "update_kv", True) is True
-    is_merge = isinstance(self.kv_cluster, CovarianceMerge)
+    is_merge = getattr(self.kv_cluster, "uses_merge_metadata", False)
 
     # CovarianceMerge carries two kinds of side state through the generic channels in
     # rkv/batching.py: per-slot (beta, n), which must be re-indexed exactly like the keys, and
@@ -298,7 +300,7 @@ def LlamaAttention_init(
     self.kv_cluster = KV_COMPRESSION_MAP[compression_config["method"]](
         **compression_config["method_config"]
     )
-    if isinstance(self.kv_cluster, CovarianceMerge):
+    if getattr(self.kv_cluster, "uses_merge_metadata", False):
         # The mask FORMAT the upstream model code builds is keyed off `_attn_implementation`
         # (bool for sdpa, additive float for eager), independently of which attention function we
         # install below. Overriding only the function leaves eager reading an sdpa-shaped mask,
@@ -335,13 +337,11 @@ def LlamaAttention_forward(
         # =============== Enable Query Cache ============
         # CovarianceMerge keeps online future-query moments instead of a recent-query window, so the
         # window is not maintained for it at all.
-        if isinstance(self.kv_cluster, CovarianceMerge):
+        if getattr(self.kv_cluster, "uses_merge_metadata", False):
             _update_merge_moments(self, past_key_value, prerope_query)
-            query_window_needed = False
-        else:
-            query_window_needed = True
-            if not hasattr(past_key_value, "query_cache"):
-                past_key_value.query_cache = {}
+        query_window_needed = getattr(self.kv_cluster, "uses_query_window", True)
+        if query_window_needed and not hasattr(past_key_value, "query_cache"):
+            past_key_value.query_cache = {}
 
         if query_window_needed and (self.layer_idx not in past_key_value.query_cache):
             # prefill stage
@@ -368,9 +368,9 @@ def LlamaAttention_forward(
 
         # =============== decoding-time compression start ===============
         cached_queries = (
-            query_states
-            if isinstance(self.kv_cluster, CovarianceMerge)
-            else past_key_value.query_cache[self.layer_idx]
+            past_key_value.query_cache[self.layer_idx]
+            if query_window_needed
+            else query_states
         )
         key_states, value_states, attention_mask = _compression_step(
             self,
@@ -385,7 +385,7 @@ def LlamaAttention_forward(
         # =============== decoding-time compression end ===============
 
     attention_interface: Callable = eager_attention_forward
-    if isinstance(self.kv_cluster, CovarianceMerge):
+    if getattr(self.kv_cluster, "uses_merge_metadata", False):
         attention_interface = covariance_merge_eager_attention_forward
     elif self.config._attn_implementation != "eager":
         if self.config._attn_implementation == "sdpa" and kwargs.get(
@@ -446,7 +446,7 @@ def Qwen2Attention_init(
     self.kv_cluster = KV_COMPRESSION_MAP[compression_config["method"]](
         **compression_config["method_config"]
     )
-    if isinstance(self.kv_cluster, CovarianceMerge):
+    if getattr(self.kv_cluster, "uses_merge_metadata", False):
         # The mask FORMAT the upstream model code builds is keyed off `_attn_implementation`
         # (bool for sdpa, additive float for eager), independently of which attention function we
         # install below. Overriding only the function leaves eager reading an sdpa-shaped mask,
@@ -483,13 +483,11 @@ def Qwen2Attention_forward(
         # =============== Enable Query Cache ============
         # CovarianceMerge keeps online future-query moments instead of a recent-query window, so the
         # window is not maintained for it at all.
-        if isinstance(self.kv_cluster, CovarianceMerge):
+        if getattr(self.kv_cluster, "uses_merge_metadata", False):
             _update_merge_moments(self, past_key_value, prerope_query)
-            query_window_needed = False
-        else:
-            query_window_needed = True
-            if not hasattr(past_key_value, "query_cache"):
-                past_key_value.query_cache = {}
+        query_window_needed = getattr(self.kv_cluster, "uses_query_window", True)
+        if query_window_needed and not hasattr(past_key_value, "query_cache"):
+            past_key_value.query_cache = {}
 
         if query_window_needed and (self.layer_idx not in past_key_value.query_cache):
             # prefill stage
@@ -516,9 +514,9 @@ def Qwen2Attention_forward(
 
         # =============== decoding-time compression start ===============
         cached_queries = (
-            query_states
-            if isinstance(self.kv_cluster, CovarianceMerge)
-            else past_key_value.query_cache[self.layer_idx]
+            past_key_value.query_cache[self.layer_idx]
+            if query_window_needed
+            else query_states
         )
         key_states, value_states, attention_mask = _compression_step(
             self,
@@ -541,7 +539,7 @@ def Qwen2Attention_forward(
         sliding_window = self.config.sliding_window
 
     attention_interface: Callable = eager_attention_forward
-    if isinstance(self.kv_cluster, CovarianceMerge):
+    if getattr(self.kv_cluster, "uses_merge_metadata", False):
         attention_interface = covariance_merge_eager_attention_forward
     elif self.config._attn_implementation != "eager":
         if self.config._attn_implementation == "sdpa" and kwargs.get(
@@ -611,7 +609,7 @@ def Qwen3Attention_init(
         self.kv_cluster = KV_COMPRESSION_MAP[compression_config["method"]](
             **compression_config["method_config"]
         )
-        if isinstance(self.kv_cluster, CovarianceMerge):
+        if getattr(self.kv_cluster, "uses_merge_metadata", False):
             self.config._attn_implementation = "eager"
             assert_rope_composes(self.config)
         # =============== New logic end =================
@@ -645,13 +643,11 @@ def Qwen3Attention_forward(
         # =============== Enable Query Cache ============
         # CovarianceMerge keeps online future-query moments instead of a recent-query window, so the
         # window is not maintained for it at all.
-        if isinstance(self.kv_cluster, CovarianceMerge):
+        if getattr(self.kv_cluster, "uses_merge_metadata", False):
             _update_merge_moments(self, past_key_value, prerope_query)
-            query_window_needed = False
-        else:
-            query_window_needed = True
-            if not hasattr(past_key_value, "query_cache"):
-                past_key_value.query_cache = {}
+        query_window_needed = getattr(self.kv_cluster, "uses_query_window", True)
+        if query_window_needed and not hasattr(past_key_value, "query_cache"):
+            past_key_value.query_cache = {}
 
         if query_window_needed and (self.layer_idx not in past_key_value.query_cache):
             # prefill stage
@@ -678,9 +674,9 @@ def Qwen3Attention_forward(
 
         # =============== decoding-time compression start ===============
         cached_queries = (
-            query_states
-            if isinstance(self.kv_cluster, CovarianceMerge)
-            else past_key_value.query_cache[self.layer_idx]
+            past_key_value.query_cache[self.layer_idx]
+            if query_window_needed
+            else query_states
         )
         key_states, value_states, attention_mask = _compression_step(
             self,
@@ -695,7 +691,7 @@ def Qwen3Attention_forward(
         # =============== decoding-time compression end ===============
 
     attention_interface: Callable = eager_attention_forward
-    if isinstance(self.kv_cluster, CovarianceMerge):
+    if getattr(self.kv_cluster, "uses_merge_metadata", False):
         attention_interface = covariance_merge_eager_attention_forward
     elif self.config._attn_implementation != "eager":
         if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
@@ -836,7 +832,7 @@ def CausalLM_forward(
     # Only needed on steps that actually compress; the moments themselves update every step.
     if (
         past_key_values is not None
-        and getattr(self.config, "method", None) == "covariance_merge"
+        and getattr(self.config, "method", None) in ("covariance_merge", "rkv_merge")
         and self.config.compression is not False
     ):
         if position_ids is not None:
