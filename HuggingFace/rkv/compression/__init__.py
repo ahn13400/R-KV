@@ -7,5 +7,6 @@ from .h2o import H2O
 from .analysiskv import AnalysisKV
 from .covariance_merge import CovarianceMerge
 from .rkv_merge import RKVMerge
+from .rkv_merge_anchor import RKVMergeAnchor
 
-__all__ = ["R1KV", "SnapKV", "StreamingLLM", "H2O", "AnalysisKV", "CovarianceMerge", "RKVMerge"]
+__all__ = ["R1KV", "SnapKV", "StreamingLLM", "H2O", "AnalysisKV", "CovarianceMerge", "RKVMerge", "RKVMergeAnchor"]

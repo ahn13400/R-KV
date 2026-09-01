@@ -30,6 +30,8 @@ def constant_gap_merge(
     mu_flat,
     scaling,
     merge_threshold,
+    target_allowed=None,
+    representative="centroid",
 ):
     """Merge each source into its nearest surviving target, or evict it.
 
@@ -41,8 +43,24 @@ def constant_gap_merge(
       * `*_mu_dot`-- mu . k per slot, likewise precomputed
       * `cov_flat`, `mu_flat` -- (f, D, D) and (f, D), the future-query moments
 
+    `target_allowed` -- optional (f, budget) bool marking which survivors may absorb a source.
+    Disallowed columns get an infinite distance, so a source whose only near neighbours are
+    ineligible is evicted rather than forced into a bad target. `None` allows every survivor.
+
+    `representative` -- `"centroid"` stores the mass-weighted mean of the member keys;
+    `"anchor"` keeps the target's own key verbatim. The value and bias formulas below are
+    *independent of this choice*: under the constant-gap approximation,
+
+        sum_j exp(beta_j + s q.k_j) ~= exp(s q.k_C) * sum_j exp(beta_j + s mu.(k_j - k_C)),
+
+    so `v_C = softmax_j(proj_j) . v_j` and `beta_C = LSE_j(proj_j) - s mu.k_C` hold for whatever
+    `k_C` is stored -- only the numerical value of `beta_C` differs. Anchor mode keeps every stored
+    key a genuine post-RoPE key the model actually produced; centroid mode minimises the expected
+    gap to the members it represents.
+
     Returns `(new_key, new_value, new_beta, new_n)`, each (f, budget, ...).
     """
+    assert representative in ("centroid", "anchor"), representative
     head_dim = kept_keys.shape[-1]
 
     # ---- nearest surviving target per source, under the covariance quadratic form ----
@@ -50,10 +68,13 @@ def constant_gap_merge(
     # (n_remove, budget, head_dim) tensor of pairwise differences
     cross = torch.einsum("fsd,fde,fke->fsk", src_keys, cov_flat, kept_keys)
     dist2_raw = src_quad.unsqueeze(-1) + kept_quad.unsqueeze(1) - 2 * cross
+    if target_allowed is not None:
+        dist2_raw = dist2_raw.masked_fill(~target_allowed.unsqueeze(1), float("inf"))
 
     nearest_dist2_raw, nearest_target = dist2_raw.min(dim=-1)
     # units: squared logits, so sqrt(threshold) is a predicted std deviation of the source/target
-    # logit gap in nats. A source that fails this is evicted outright rather than merged.
+    # logit gap in nats. A source that fails this is evicted outright rather than merged. An
+    # all-ineligible row yields +inf here, which fails for any finite threshold.
     merge_ok = (scaling**2) * nearest_dist2_raw <= merge_threshold
 
     # ---- recursive merge: every kept slot absorbs whichever sources (0, 1, or many) chose it
@@ -65,11 +86,16 @@ def constant_gap_merge(
     added_mass = torch.zeros_like(kept_n).scatter_add_(1, nearest_target, src_mass)
     new_n = kept_n + added_mass
 
-    weighted_src_key = src_keys * src_mass.unsqueeze(-1)
-    added_key_sum = torch.zeros_like(kept_keys).scatter_add_(
-        1, nearest_target.unsqueeze(-1).expand(-1, -1, head_dim), weighted_src_key
-    )
-    new_key = (kept_keys * kept_n.unsqueeze(-1) + added_key_sum) / new_n.unsqueeze(-1)
+    if representative == "anchor":
+        # The target's own key, verbatim. Bit-exact when nothing merged into it, and every stored
+        # key stays a real post-RoPE key rather than a synthetic point in key space.
+        new_key = kept_keys
+    else:
+        weighted_src_key = src_keys * src_mass.unsqueeze(-1)
+        added_key_sum = torch.zeros_like(kept_keys).scatter_add_(
+            1, nearest_target.unsqueeze(-1).expand(-1, -1, head_dim), weighted_src_key
+        )
+        new_key = (kept_keys * kept_n.unsqueeze(-1) + added_key_sum) / new_n.unsqueeze(-1)
 
     # log-sum-exp over each cluster's members, computed in a max-shifted form so a large proj
     # cannot overflow. Sources that failed the threshold are excluded via -inf.
