@@ -8,5 +8,6 @@ from .analysiskv import AnalysisKV
 from .covariance_merge import CovarianceMerge
 from .rkv_merge import RKVMerge
 from .rkv_merge_anchor import RKVMergeAnchor
+from .rkv_merge_anchor_diag import RKVMergeAnchorDiag
 
-__all__ = ["R1KV", "SnapKV", "StreamingLLM", "H2O", "AnalysisKV", "CovarianceMerge", "RKVMerge", "RKVMergeAnchor"]
+__all__ = ["R1KV", "SnapKV", "StreamingLLM", "H2O", "AnalysisKV", "CovarianceMerge", "RKVMerge", "RKVMergeAnchor", "RKVMergeAnchorDiag"]

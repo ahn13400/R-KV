@@ -39,6 +39,17 @@ def compute_attention_scores(query_states, key_states, pooling="max"):
     return attn_weights
 
 
+def compute_attention_scores_corrected(query_states, key_states, pooling="max"):
+    """
+    attention score computation with attention bias, corrected. 
+    We should first compute softmax per query head, and then aggregate.
+    Similarly, for attention bias, we should expand beta_states to [B, Hq, Tq, Tk],
+    and then add it to the per query head logits [B, Hq, Tq, Tk],
+    then softmax it, then aggregate.
+    """
+    pass  # TODO
+    
+
 def cal_similarity(
     key_states,
     threshold=0.5,
