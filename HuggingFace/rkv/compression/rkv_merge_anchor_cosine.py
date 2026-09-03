@@ -6,8 +6,24 @@ from . import cal_similarity, compute_attention_scores
 from .merge_core import constant_gap_merge
 
 
-class RKVMergeAnchorDiag:
-    """R-KV Eviction Scorer + Covariance Merging. Use Diagonal covariance instead of full.
+class RKVMergeAnchorCosine:
+    """R-KV eviction scorer + anchor merging, target search under cosine similarity.
+
+    Same as `RKVMergeAnchorID` (identity metric = plain squared L2 distance) except the merge
+    target is chosen by angle rather than magnitude: keys are L2-normalised *only for the target
+    search*, so `dist2 = ||k_hat_a - k_hat_c||^2 = 2(1 - cos_sim(a, c))` for unit vectors. This is
+    the same identity-covariance quadratic form `merge_core` already computes -- normalising the
+    keys first is what turns it into a cosine metric, so no new distance code is needed there.
+
+    Everything downstream of target selection is untouched: `mu.k` (used in the importance score
+    and in the merge's `beta`/value update) is computed on the *original*, un-normalised keys, and
+    the anchor representative stores the target's own original key, never the normalised one. Only
+    which target a source is assigned to, and whether it clears the threshold, depends on the
+    normalised keys.
+
+    Threshold units differ from the covariance/diag/id metrics: `dist2` here is a chordal distance
+    bounded in [0, 4], not a predicted logit-gap variance, so `merge_threshold` is compared to it
+    directly (`threshold_scale=1.0`) rather than scaled by `scaling**2`.
     """
 
     uses_merge_metadata = True
@@ -117,14 +133,21 @@ class RKVMergeAnchorDiag:
         mu_flat = mu.reshape(flat, head_dim).float()
         cov_flat = cov.reshape(flat, head_dim, head_dim).float()
 
-        ############################ Diagonalization ablation ####################################
-        # most of the information is in the diagonal entries
-        I = torch.eye(cov_flat.size(-1), device=cov_flat.device)
-        cov_flat = cov_flat * I
-        ############################ Diagonalization ablation ####################################
-
-        quad = torch.einsum("ftd,fde,fte->ft", key_flat, cov_flat, key_flat)
+        # mu.k for the importance score and the merge's beta/value update: always the true,
+        # un-normalised post-RoPE key. Normalisation below is for target *search* only.
         mu_dot_k = torch.einsum("ftd,fd->ft", key_flat, mu_flat)
+
+        ############################ Cosine-similarity target search #################################
+        # Identity metric applied to unit-normalised keys: for unit vectors a, c,
+        #   ||a - c||^2 = 2 - 2 a.c = 2(1 - cos_sim(a, c)).
+        # So this reuses merge_core's identity-covariance quadratic form unchanged -- only the keys
+        # fed into it are normalised. `quad` (== 1 for every slot, up to normalisation eps) and the
+        # cross term are computed on this normalised copy, decoupled from the keys used for storage
+        # and for mu_dot_k above via `dist_kept_keys` / `dist_src_keys`.
+        cov_flat = torch.eye(head_dim, device=cov_flat.device).repeat(flat, 1, 1)
+        key_dist_flat = F.normalize(key_flat, dim=-1, eps=1e-8)
+        quad = torch.einsum("ftd,ftd->ft", key_dist_flat, key_dist_flat)
+        ############################ Cosine-similarity target search #################################
 
         kept_idx_flat = kept_idx.reshape(flat, self.budget)
         src_idx_flat = src_pos.reshape(flat, n_remove)
@@ -158,6 +181,9 @@ class RKVMergeAnchorDiag:
             merge_ratio=self.merge_ratio,
             target_allowed=target_allowed,
             representative="anchor",   # CHANGE 3
+            dist_kept_keys=torch.gather(key_dist_flat, 1, expand_kept),
+            dist_src_keys=torch.gather(key_dist_flat, 1, expand_src),
+            threshold_scale=1.0,  # dist2 is already a dimensionless chordal distance in [0, 4]
         )
 
         new_key = new_key.reshape(bsz, num_kv_heads, self.budget, head_dim).to(key_states.dtype)

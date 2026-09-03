@@ -10,5 +10,6 @@ from .rkv_merge import RKVMerge
 from .rkv_merge_anchor import RKVMergeAnchor
 from .rkv_merge_anchor_diag import RKVMergeAnchorDiag
 from .rkv_merge_anchor_id import RKVMergeAnchorID
+from .rkv_merge_anchor_cosine import RKVMergeAnchorCosine
 
-__all__ = ["R1KV", "SnapKV", "StreamingLLM", "H2O", "AnalysisKV", "CovarianceMerge", "RKVMerge", "RKVMergeAnchor", "RKVMergeAnchorDiag", "RKVMergeAnchorID"]
+__all__ = ["R1KV", "SnapKV", "StreamingLLM", "H2O", "AnalysisKV", "CovarianceMerge", "RKVMerge", "RKVMergeAnchor", "RKVMergeAnchorDiag", "RKVMergeAnchorID", "RKVMergeAnchorCosine"]

@@ -1,9 +1,10 @@
 #!/bin/bash
-
 set -uo pipefail
 
+# Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=sweep_config.sh
+
+# Get run config
 source "${SCRIPT_DIR}/sweep_config.sh"
 
 DRY_RUN=0
@@ -13,26 +14,29 @@ DRY_RUN=0
 read -r -a DATASETS <<<"${DATASETS[*]}"
 read -r -a METHODS <<<"${METHODS[*]}"
 
+# Sweep log gets stored here (not the individual runs. They get stored in their respective folders)
 SWEEP_START_EPOCH="$(date +%s)"
 SWEEP_STAMP="$(date +%Y%m%d-%H%M%S)"
 SWEEP_LOG_DIR="${RUNS_ROOT}/_sweeps"
 SWEEP_LOG="${SWEEP_LOG_DIR}/sweep-${SWEEP_STAMP}.log"
 
+# --------------------- some helpful funcftions ---------------------
 log() {
     local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $*"
     echo "${msg}"
     [[ ${DRY_RUN} -eq 0 ]] && echo "${msg}" >>"${SWEEP_LOG}"
     return 0
 }
-
 hms() { printf '%dh%02dm%02ds' $(($1 / 3600)) $((($1 % 3600) / 60)) $(($1 % 60)); }
+# --------------------- some helpful funcftions ---------------------
 
 if [[ ${DRY_RUN} -eq 0 ]]; then
     mkdir -p "${SWEEP_LOG_DIR}"
     : >"${SWEEP_LOG}"
 fi
 
-# --------------------------------------------------------------- sanity checks
+
+# --------------------- sanity checks ---------------------
 cd "${HF_ROOT}" || exit 1
 
 if [[ ! -d "${MODEL_PATH}" ]]; then
@@ -47,13 +51,16 @@ for dataset in "${DATASETS[@]}"; do
 done
 for method in "${METHODS[@]}"; do
     case "${method}" in
-        fullkv | rkv | snapkv | h2o | streamingllm | covariance_merge | rkv_merge | rkv_merge_anchor | rkv_merge_anchor_diag | rkv_merge_anchor_id) ;;
+        fullkv | rkv | snapkv | h2o | streamingllm | covariance_merge | rkv_merge | \
+        rkv_merge_anchor | rkv_merge_anchor_diag | rkv_merge_anchor_id | rkv_merge_anchor_cosine)
+            ;;
         *)
-            log "FATAL: unknown method '${method}' (expected: fullkv rkv snapkv h2o streamingllm covariance_merge rkv_merge rkv_merge_anchor)"
+            log "FATAL: unknown method '${method}'"
             exit 1
             ;;
     esac
 done
+# --------------------- sanity checks ---------------------
 
 # ------------------------------------------------------------------ the plan
 log "================ sweep plan ================"
@@ -154,10 +161,12 @@ run_one() {
   "repetition_min_period": ${REPETITION_MIN_PERIOD},
   "repetition_max_period": ${REPETITION_MAX_PERIOD},
   "trim_incomplete_boxed": $([[ "${TRIM_INCOMPLETE_BOXED}" == "1" ]] && echo true || echo false),
-  "merge_threshold": $(if [[ "${method}" == "covariance_merge" || "${method}" == "rkv_merge" || "${method}" == "rkv_merge_anchor" || "${method}" == "rkv_merge_anchor_diag" || "${method}" == "rkv_merge_anchor_id" ]]; then echo "${MERGE_THRESHOLD}"; else echo null; fi),
-  "ema_half_life": $(if [[ "${method}" == "covariance_merge" || "${method}" == "rkv_merge" || "${method}" == "rkv_merge_anchor" || "${method}" == "rkv_merge_anchor_diag" || "${method}" == "rkv_merge_anchor_id" ]]; then echo "${EMA_HALF_LIFE}"; else echo null; fi),
-  "future_horizon": $(if [[ "${method}" == "covariance_merge" || "${method}" == "rkv_merge" || "${method}" == "rkv_merge_anchor" || "${method}" == "rkv_merge_anchor_diag" || "${method}" == "rkv_merge_anchor_id" ]]; then echo "${FUTURE_HORIZON}"; else echo null; fi),
-  "future_decay": $(if [[ "${method}" == "covariance_merge" || "${method}" == "rkv_merge" || "${method}" == "rkv_merge_anchor" || "${method}" == "rkv_merge_anchor_diag" || "${method}" == "rkv_merge_anchor_id" ]]; then echo "${FUTURE_DECAY}"; else echo null; fi),
+  "merge_threshold": $(if [[ "${method}" == "covariance_merge" || "${method}" == "rkv_merge" || "${method}" == "rkv_merge_anchor" || "${method}" == "rkv_merge_anchor_diag" || "${method}" == "rkv_merge_anchor_id" || "${method}" == "rkv_merge_anchor_cosine" ]]; then echo "${MERGE_THRESHOLD}"; else echo null; fi),
+  "merge_count": $(if [[ "${method}" == "covariance_merge" || "${method}" == "rkv_merge" || "${method}" == "rkv_merge_anchor" || "${method}" == "rkv_merge_anchor_diag" || "${method}" == "rkv_merge_anchor_id" || "${method}" == "rkv_merge_anchor_cosine" ]] && [[ -n "${MERGE_COUNT}" ]]; then echo "${MERGE_COUNT}"; else echo null; fi),
+  "merge_ratio": $(if [[ "${method}" == "covariance_merge" || "${method}" == "rkv_merge" || "${method}" == "rkv_merge_anchor" || "${method}" == "rkv_merge_anchor_diag" || "${method}" == "rkv_merge_anchor_id" || "${method}" == "rkv_merge_anchor_cosine" ]] && [[ -n "${MERGE_RATIO}" ]]; then echo "${MERGE_RATIO}"; else echo null; fi),
+  "ema_half_life": $(if [[ "${method}" == "covariance_merge" || "${method}" == "rkv_merge" || "${method}" == "rkv_merge_anchor" || "${method}" == "rkv_merge_anchor_diag" || "${method}" == "rkv_merge_anchor_id" || "${method}" == "rkv_merge_anchor_cosine" ]]; then echo "${EMA_HALF_LIFE}"; else echo null; fi),
+  "future_horizon": $(if [[ "${method}" == "covariance_merge" || "${method}" == "rkv_merge" || "${method}" == "rkv_merge_anchor" || "${method}" == "rkv_merge_anchor_diag" || "${method}" == "rkv_merge_anchor_id" || "${method}" == "rkv_merge_anchor_cosine" ]]; then echo "${FUTURE_HORIZON}"; else echo null; fi),
+  "future_decay": $(if [[ "${method}" == "covariance_merge" || "${method}" == "rkv_merge" || "${method}" == "rkv_merge_anchor" || "${method}" == "rkv_merge_anchor_diag" || "${method}" == "rkv_merge_anchor_id" || "${method}" == "rkv_merge_anchor_cosine" ]]; then echo "${FUTURE_DECAY}"; else echo null; fi),
   "tag": "$(run_tag "${method}")",
   "started_at": "$(date -Is)"
 }
@@ -183,12 +192,11 @@ EOF
         --divide_length "${DIVIDE_LENGTH}"
         --compression_content "${COMPRESSION_CONTENT}"
     )
-    # run_math.py's flag is --apply_chat_template; --enable_thinking is a
-    # separate store_true flag it only reads inside that branch (passed as
-    # tokenizer.apply_chat_template's enable_thinking= kwarg), so it's a
-    # no-op unless apply_chat_template is also on.
+    # Chat template + thinking mode
     [[ "${USE_CHAT_TEMPLATE}" == "1" ]] && cmd+=(--apply_chat_template)
     [[ "${USE_CHAT_TEMPLATE}" == "1" && "${ENABLE_THINKING}" == "1" ]] && cmd+=(--enable_thinking)
+
+    # force stopping when repetition is detected
     if [[ "${STOP_ON_REPETITION}" == "1" ]]; then
         cmd+=(
             --stop_on_repetition
@@ -197,15 +205,33 @@ EOF
             --repetition_max_period "${REPETITION_MAX_PERIOD}"
         )
     fi
+
+    # Save some of the false results due to inifinte repetition
     [[ "${TRIM_INCOMPLETE_BOXED}" == "1" ]] && cmd+=(--trim_incomplete_boxed)
-    if [[ "${method}" == "covariance_merge" || "${method}" == "rkv_merge" || "${method}" == "rkv_merge_anchor" || "${method}" == "rkv_merge_anchor_diag" || "${method}" == "rkv_merge_anchor_id" ]]; then
+
+    # Methods that use online future query model
+    if [[ "${method}" == "covariance_merge" \
+       || "${method}" == "rkv_merge" \
+       || "${method}" == "rkv_merge_anchor" \
+       || "${method}" == "rkv_merge_anchor_diag" \
+       || "${method}" == "rkv_merge_anchor_id" \
+       || "${method}" == "rkv_merge_anchor_cosine" ]]; then
         cmd+=(
-            --merge_threshold "${MERGE_THRESHOLD}"
             --ema_half_life "${EMA_HALF_LIFE}"
             --future_horizon "${FUTURE_HORIZON}"
             --future_decay "${FUTURE_DECAY}"
         )
+        # MERGE_RATIO overrides MERGE_COUNT overrides MERGE_THRESHOLD -- see
+        # merge_core.constant_gap_merge -- so pass exactly one, never more than one.
+        if [[ -n "${MERGE_RATIO}" ]]; then
+            cmd+=(--merge_ratio "${MERGE_RATIO}")
+        elif [[ -n "${MERGE_COUNT}" ]]; then
+            cmd+=(--merge_count "${MERGE_COUNT}")
+        else
+            cmd+=(--merge_threshold "${MERGE_THRESHOLD}")
+        fi
     fi
+
     # kv_budget and the eviction hyperparameters are meaningless for fullkv and
     # would trip the `budget - window_size > 0` asserts if budget were unset.
     if [[ "${method}" != "fullkv" ]]; then
@@ -226,6 +252,7 @@ EOF
     log "RUN  ${dataset}/${method} -> ${dir}"
     local t0 t1
     t0="$(date +%s)"
+    # Run the actual generation
     "${cmd[@]}" >"${log_dir}/generate.log" 2>&1
     local gen_rc=$?
     t1="$(date +%s)"

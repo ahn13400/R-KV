@@ -38,6 +38,8 @@ class CovarianceMerge:
         window_size=8,
         first_tokens=0,
         merge_threshold=1.0,
+        merge_count=None,
+        merge_ratio=None,
         **kwargs,
     ):
         assert budget - window_size - first_tokens > 0, (
@@ -48,6 +50,8 @@ class CovarianceMerge:
         self.n_recent = window_size
         self.n_sink = first_tokens
         self.merge_threshold = merge_threshold
+        self.merge_count = merge_count
+        self.merge_ratio = merge_ratio
 
     def update_kv(
         self,
@@ -131,6 +135,8 @@ class CovarianceMerge:
             src_quad=src_q, src_mu_dot=src_mu_dot,
             cov_flat=cov_flat, mu_flat=mu_flat, scaling=scaling,
             merge_threshold=self.merge_threshold,
+            merge_count=self.merge_count,
+            merge_ratio=self.merge_ratio,
         )
 
         new_key = new_key.reshape(bsz, num_kv_heads, self.budget, head_dim).to(key_states.dtype)

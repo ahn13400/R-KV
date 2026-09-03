@@ -46,6 +46,8 @@ class RKVMerge:
         retain_ratio=0.1,
         retain_direction="last",
         merge_threshold=1.0,
+        merge_count=None,
+        merge_ratio=None,
         **kwargs,
     ):
         assert budget - window_size > 0, "budget must be greater than window_size"
@@ -56,6 +58,8 @@ class RKVMerge:
         self.retain_ratio = retain_ratio
         self.retain_direction = retain_direction
         self.merge_threshold = merge_threshold
+        self.merge_count = merge_count
+        self.merge_ratio = merge_ratio
         # NOTE: `first_tokens` is accepted via **kwargs and deliberately ignored. R-KV has no sink
         # protection, and adding one here would make this a different scorer, defeating the ablation.
 
@@ -166,6 +170,8 @@ class RKVMerge:
             mu_flat=mu_flat,
             scaling=scaling,
             merge_threshold=self.merge_threshold,
+            merge_count=self.merge_count,
+            merge_ratio=self.merge_ratio,
         )
 
         new_key = new_key.reshape(bsz, num_kv_heads, self.budget, head_dim).to(key_states.dtype)

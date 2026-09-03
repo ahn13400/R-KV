@@ -23,6 +23,8 @@ class RKVMergeAnchorID:
         retain_ratio=0.1,
         retain_direction="last",
         merge_threshold=1.0,
+        merge_count=None,
+        merge_ratio=None,
         **kwargs,
     ):
         assert budget - window_size - first_tokens > 0, (
@@ -37,6 +39,8 @@ class RKVMergeAnchorID:
         self.retain_ratio = retain_ratio
         self.retain_direction = retain_direction
         self.merge_threshold = merge_threshold
+        self.merge_count = merge_count
+        self.merge_ratio = merge_ratio
 
     def update_kv(
         self,
@@ -148,6 +152,8 @@ class RKVMergeAnchorID:
             mu_flat=mu_flat,
             scaling=scaling,
             merge_threshold=self.merge_threshold,
+            merge_count=self.merge_count,
+            merge_ratio=self.merge_ratio,
             target_allowed=target_allowed,
             representative="anchor",   # CHANGE 3
         )

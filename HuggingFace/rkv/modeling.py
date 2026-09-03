@@ -33,6 +33,7 @@ from .compression import (
     RKVMergeAnchor,
     RKVMergeAnchorDiag,
     RKVMergeAnchorID,
+    RKVMergeAnchorCosine,
 )
 from .query_moments import (
     assert_rope_composes,
@@ -53,6 +54,7 @@ KV_COMPRESSION_MAP = {
     "rkv_merge_anchor": RKVMergeAnchor,
     "rkv_merge_anchor_diag": RKVMergeAnchorDiag,
     "rkv_merge_anchor_id": RKVMergeAnchorID,
+    "rkv_merge_anchor_cosine": RKVMergeAnchorCosine,
 }
 
 logger = logging.get_logger(__name__)
@@ -838,7 +840,7 @@ def CausalLM_forward(
     # Only needed on steps that actually compress; the moments themselves update every step.
     if (
         past_key_values is not None
-        and getattr(self.config, "method", None) in ("covariance_merge", "rkv_merge", "rkv_merge_anchor", "rkv_merge_anchor_diag", "rkv_merge_anchor_id")
+        and getattr(self.config, "method", None) in ("covariance_merge", "rkv_merge", "rkv_merge_anchor", "rkv_merge_anchor_diag", "rkv_merge_anchor_id", "rkv_merge_anchor_cosine")
         and self.config.compression is not False
     ):
         if position_ids is not None:

@@ -32,6 +32,11 @@ def constant_gap_merge(
     merge_threshold,
     target_allowed=None,
     representative="centroid",
+    dist_kept_keys=None,
+    dist_src_keys=None,
+    threshold_scale=None,
+    merge_count=None,
+    merge_ratio=None,
 ):
     """Merge each source into its nearest surviving target, or evict it.
 
@@ -58,24 +63,82 @@ def constant_gap_merge(
     key a genuine post-RoPE key the model actually produced; centroid mode minimises the expected
     gap to the members it represents.
 
+    `dist_kept_keys` / `dist_src_keys` -- optional stand-ins for `kept_keys` / `src_keys` used only
+    in the nearest-target search below, decoupled from the keys used for storage (anchor mode) and
+    for `*_mu_dot`. This is what lets a press swap in an L2-normalised copy of the keys to get a
+    cosine-similarity metric (`cov_flat = I`, so the quadratic form is a plain dot product, and
+    `dist2 = 2(1 - cos_sim)` for unit vectors) without storing normalised keys in the cache or
+    computing `mu.k` on the wrong keys. Default: `kept_keys` / `src_keys`, i.e. no change.
+
+    `threshold_scale` -- multiplies `nearest_dist2_raw` before comparing to `merge_threshold`.
+    Default `scaling**2`, which makes the comparison "predicted variance of the source/target logit
+    gap" when `dist_*_keys` are un-normalised (see module docstring). A press using a
+    non-Mahalanobis metric (e.g. cosine, where `dist2` has no variance interpretation) should pass
+    its own scale -- typically `1.0`, comparing the raw chordal distance directly.
+
+    `merge_count` -- if given (an int), overrides `merge_threshold` entirely: per (batch, KV head)
+    row, only the `merge_count` sources with the *smallest* nearest-target distance are merged; every
+    other source is evicted outright, regardless of how close it actually was. This is a fixed-ratio
+    selection rule (exactly `merge_count` merges per eviction step, whatever the data) as opposed to
+    `merge_threshold`'s data-dependent one (however many sources happen to clear the cutoff). Rows
+    with fewer than `merge_count` finite-distance candidates (e.g. `target_allowed` ruled out most
+    survivors) merge as many as they have and evict the rest. `None` (default) uses the threshold
+    rule above; the two are mutually exclusive by construction -- `merge_threshold` is ignored
+    whenever `merge_count` is not `None`.
+
+    `merge_ratio` -- if given (a float in [0, 1]), overrides both `merge_count` and
+    `merge_threshold`: `round(merge_ratio * n_remove)` sources merge, same nearest-first selection
+    as `merge_count`. This is what makes the fixed-ratio rule scale-invariant across eviction
+    events of very different size -- e.g. the huge one-shot eviction right after prefill (n_remove
+    can be hundreds of tokens) versus the small steady-state ones during decoding (n_remove is
+    typically the compression clock length). A fixed `merge_count` of, say, 1 is a reasonable
+    fraction of a 32-token steady-state eviction but merges almost nothing of a 700-token prefill
+    eviction; `merge_ratio` keeps the same *proportion* merged at both.
+
     Returns `(new_key, new_value, new_beta, new_n)`, each (f, budget, ...).
     """
     assert representative in ("centroid", "anchor"), representative
     head_dim = kept_keys.shape[-1]
+    dist_kept_keys = kept_keys if dist_kept_keys is None else dist_kept_keys
+    dist_src_keys = src_keys if dist_src_keys is None else dist_src_keys
+    threshold_scale = scaling**2 if threshold_scale is None else threshold_scale
 
     # ---- nearest surviving target per source, under the covariance quadratic form ----
     # d(a,c) = a^T Sigma a + c^T Sigma c - 2 a^T Sigma c, which avoids materializing the
     # (n_remove, budget, head_dim) tensor of pairwise differences
-    cross = torch.einsum("fsd,fde,fke->fsk", src_keys, cov_flat, kept_keys)
+    cross = torch.einsum("fsd,fde,fke->fsk", dist_src_keys, cov_flat, dist_kept_keys)
     dist2_raw = src_quad.unsqueeze(-1) + kept_quad.unsqueeze(1) - 2 * cross
     if target_allowed is not None:
         dist2_raw = dist2_raw.masked_fill(~target_allowed.unsqueeze(1), float("inf"))
 
     nearest_dist2_raw, nearest_target = dist2_raw.min(dim=-1)
-    # units: squared logits, so sqrt(threshold) is a predicted std deviation of the source/target
-    # logit gap in nats. A source that fails this is evicted outright rather than merged. An
-    # all-ineligible row yields +inf here, which fails for any finite threshold.
-    merge_ok = (scaling**2) * nearest_dist2_raw <= merge_threshold
+    if merge_ratio is not None or merge_count is not None:
+        # fixed-ratio rule: exactly `k` merges per row (fewer if that many candidates are actually
+        # finite, i.e. have at least one eligible target). `rank < k` on the ascending-sorted
+        # distances gives the cutoff; the stable argsort means ties past the cutoff are excluded in
+        # source order, so at most `k` sources ever merge.
+        n_remove = nearest_dist2_raw.shape[-1]
+        if merge_ratio is not None:
+            assert 0.0 <= merge_ratio <= 1.0, merge_ratio
+            k = round(merge_ratio * n_remove)
+        else:
+            k = int(merge_count)
+        k = min(k, n_remove)
+        if k <= 0:
+            merge_ok = torch.zeros_like(nearest_dist2_raw, dtype=torch.bool)
+        else:
+            order = nearest_dist2_raw.argsort(dim=-1, stable=True)
+            rank = torch.empty_like(order).scatter_(
+                -1, order, torch.arange(n_remove, device=order.device).expand_as(order)
+            )
+            merge_ok = (rank < k) & torch.isfinite(nearest_dist2_raw)
+    else:
+        # units: squared logits under the default Mahalanobis metric, so sqrt(threshold) is a
+        # predicted std deviation of the source/target logit gap in nats -- see `threshold_scale`
+        # above for metrics where this unit interpretation does not apply. A source that fails this
+        # is evicted outright rather than merged. An all-ineligible row yields +inf here, which
+        # fails for any finite threshold.
+        merge_ok = threshold_scale * nearest_dist2_raw <= merge_threshold
 
     # ---- recursive merge: every kept slot absorbs whichever sources (0, 1, or many) chose it
     # as their nearest target and passed the threshold ----

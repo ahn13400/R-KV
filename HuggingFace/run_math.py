@@ -172,7 +172,7 @@ def parse_arguments():
         "--method",
         type=str,
         default=None,
-        choices=["rkv", "fullkv", "snapkv", "streamingllm", "h2o", "covariance_merge", "rkv_merge", "rkv_merge_anchor", "rkv_merge_anchor_diag", "rkv_merge_anchor_id"],
+        choices=["rkv", "fullkv", "snapkv", "streamingllm", "h2o", "covariance_merge", "rkv_merge", "rkv_merge_anchor", "rkv_merge_anchor_diag", "rkv_merge_anchor_id", "rkv_merge_anchor_cosine"],
     )
     parser.add_argument("--kv_budget", type=int, default=None)
     parser.add_argument("--window_size", type=int, default=8)
@@ -185,7 +185,29 @@ def parse_arguments():
         default=1.0,
         help="covariance_merge only: merge a source into its nearest target only if the predicted "
         "variance of their attention-logit gap, scaling^2 * dk^T Sigma dk, is <= this. Units are "
-        "squared logits, so sqrt is a predicted std deviation of the gap in nats.",
+        "squared logits, so sqrt is a predicted std deviation of the gap in nats. Ignored if "
+        "--merge_count or --merge_ratio is set.",
+    )
+    parser.add_argument(
+        "--merge_count",
+        type=int,
+        default=None,
+        help="merging presses only: fixed-count alternative to --merge_threshold. Exactly this many "
+        "sources merge into their nearest target per eviction step (the closest ones); every other "
+        "evicted source is dropped outright, however close it was. Overrides --merge_threshold "
+        "entirely when set; ignored if --merge_ratio is set. Not scale-invariant across eviction "
+        "events of very different size (e.g. the large one right after prefill vs. the small "
+        "steady-state ones during decoding) -- prefer --merge_ratio for that.",
+    )
+    parser.add_argument(
+        "--merge_ratio",
+        type=float,
+        default=None,
+        help="merging presses only: fixed-fraction alternative to both --merge_threshold and "
+        "--merge_count. round(merge_ratio * n_remove) sources merge per eviction step, same "
+        "nearest-first selection as --merge_count. Scale-invariant: the same fraction merges "
+        "whether n_remove is small (steady-state decode) or large (the one-shot eviction right "
+        "after prefill). Overrides both other options entirely when set.",
     )
     parser.add_argument("--update_kv", type=bool, default=True)
     parser.add_argument(
@@ -281,6 +303,8 @@ if __name__ == "__main__":
             "retain_direction": args.retain_direction,
             "first_tokens": args.first_tokens,
             "merge_threshold": args.merge_threshold,
+            "merge_count": args.merge_count,
+            "merge_ratio": args.merge_ratio,
         },
         "compression": None,
         "update_kv": args.update_kv
