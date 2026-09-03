@@ -198,7 +198,7 @@ EOF
         )
     fi
     [[ "${TRIM_INCOMPLETE_BOXED}" == "1" ]] && cmd+=(--trim_incomplete_boxed)
-    if [[ "${method}" == "covariance_merge" || "${method}" == "rkv_merge" || "${method}" == "rkv_merge_anchor" ]]; then
+    if [[ "${method}" == "covariance_merge" || "${method}" == "rkv_merge" || "${method}" == "rkv_merge_anchor" || "${method}" == "rkv_merge_anchor_diag" || "${method}" == "rkv_merge_anchor_id" ]]; then
         cmd+=(
             --merge_threshold "${MERGE_THRESHOLD}"
             --ema_half_life "${EMA_HALF_LIFE}"

@@ -172,7 +172,7 @@ def parse_arguments():
         "--method",
         type=str,
         default=None,
-        choices=["rkv", "fullkv", "snapkv", "streamingllm", "h2o", "covariance_merge", "rkv_merge", "rkv_merge_anchor"],
+        choices=["rkv", "fullkv", "snapkv", "streamingllm", "h2o", "covariance_merge", "rkv_merge", "rkv_merge_anchor", "rkv_merge_anchor_diag", "rkv_merge_anchor_id"],
     )
     parser.add_argument("--kv_budget", type=int, default=None)
     parser.add_argument("--window_size", type=int, default=8)
